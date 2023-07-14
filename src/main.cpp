@@ -1,21 +1,38 @@
-#include <HardwareSerial.h>  
 #define ENABLE_DEBUG
 
 #ifdef ENABLE_DEBUG
-       #define DEBUG_ESP_PORT Serial
-       #define NODEBUG_WEBSOCKETS
-       #define NDEBUG
-#endif 
+#define DEBUG_ESP_PORT Serial
+#define NODEBUG_WEBSOCKETS
+#define NDEBUG
+#define NODEBUG_SINRIC
+#endif
 
 #include "Secrets.h"
 
+#include <WiFiUdp.h>
+#include <Syslog.h>
+
+#define SYSLOG_PORT 514
+
+// This device info
+#define DEVICE_HOSTNAME "makerspace"
+#define APP_NAME "door-controller"
+
+// A UDP instance to let us send and receive packets over UDP
+WiFiUDP udpClient;
+
+// Create a new syslog instance with LOG_KERN facility
+Syslog syslog(udpClient, REMOTE_SYSLOG, SYSLOG_PORT, DEVICE_HOSTNAME, APP_NAME, LOG_KERN);
+int syslogIiteration = 1;
+
 #include "SinricPro.h"
 #include "SinricProGarageDoor.h"
- 
-#include <ESP8266WiFi.h> 
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
 
 #include <Keypad.h>
- 
+
 void openDoor();
 void resetInput();
 void keypadEventHandler(KeypadEvent);
@@ -23,16 +40,24 @@ void keypadEventHandler(KeypadEvent);
 void setupKeypad();
 void setupWiFi();
 void setupSinricPro();
+void setupWebserver();
 
 void keypadLoop();
 void sinricLoop();
+void webserverLoop();
 
-bool onDoorStateHandler(const String& deviceId, bool &doorState);
+void handleRoot();
+void handleApiRequest();
+void handleLogRequest();
+
+bool onDoorStateHandler(const String &deviceId, bool &doorState);
 
 const int SERIAL_SPEED = 9600;
 const int MAX_INPUT = 1024;
+const int RELAY_PIN = D7;
+
 char input[MAX_INPUT] = "";
-int inputIndex = 0; 
+int inputIndex = 0;
 const int DEBOUNCE_TIME = 50;
 
 const byte n_rows = 4;
@@ -42,25 +67,47 @@ char keys[n_rows][n_cols] = {
     {'1', '2', '3'},
     {'4', '5', '6'},
     {'7', '8', '9'},
-    {'*', '0', '#'}}; 
+    {'*', '0', '#'}};
 
 byte rowPins[n_rows] = {D2, D5, D6, D0};
 byte colPins[n_cols] = {D1, D3, D4};
-
 Keypad myKeypad = Keypad(makeKeymap(keys), rowPins, colPins, n_rows, n_cols);
- 
+
+ESP8266WebServer server(80); // Create a web server on port 80
+
 void openDoor()
 {
   Serial.print("\nOpening Door...\n");
+  digitalWrite(RELAY_PIN, LOW);
+  delay(250);
+  digitalWrite(RELAY_PIN, HIGH);
+  Serial.print("\nToggle Door Command Sent!\n");
+  syslog.logf(LOG_DEBUG, "Door opened.");
 }
 
 void setup()
 {
+
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);
+
   Serial.begin(SERIAL_SPEED);
+  while (!Serial && !Serial.available())
+    ;
+
+  Serial.setDebugOutput(true);
+
   setupKeypad();
   setupWiFi();
+  setupWebserver();
   setupSinricPro();
 
+  // initialize our logger
+
+  Serial.printf("Remote syslog server: %s\n", REMOTE_SYSLOG);
+  syslog.logf(LOG_INFO, "Remote syslog server: %s", REMOTE_SYSLOG);
+
+  syslog.log(LOG_INFO, "Setup Complete!");
   Serial.println("Setup Complete.");
 }
 
@@ -68,17 +115,19 @@ void loop()
 {
   keypadLoop();
   sinricLoop();
+  server.handleClient(); // Handle incoming client requests
+  delay(5);
 }
 
-
-
-void setupKeypad() {
+void setupKeypad()
+{
   myKeypad.addEventListener(keypadEventHandler);
   myKeypad.setDebounceTime(DEBOUNCE_TIME);
   resetInput();
 }
 
-void keypadEventHandler(KeypadEvent ekey) {
+void keypadEventHandler(KeypadEvent ekey)
+{
   if (myKeypad.getState() == PRESSED)
   {
 
@@ -97,24 +146,24 @@ void keypadEventHandler(KeypadEvent ekey) {
       input[inputIndex] = ekey;
       inputIndex++;
       Serial.print(ekey);
+      syslog.logf(LOG_DEBUG, "Keypad button pushed: %c", ekey);
 
       break;
     // Clear input
     case '*':
-      Serial.printf("\nInput: %s==%s? %d", input, keypadPassword, strcmp(input, keypadPassword) == 0);
-      break;
     case '#':
       resetInput();
+      syslog.log(LOG_INFO, "Input cleared!");
+
       Serial.print("\nCLEARED!\n");
       break;
     default:
-      Serial.print("\nmDefault!\n");
-
       break;
     }
   }
   if (strcmp(input, keypadPassword) == 0)
   {
+    syslog.log(LOG_INFO, "Keypad Password correct!");
     Serial.print("\nPassword Correct!\n");
     resetInput();
 
@@ -131,31 +180,47 @@ void resetInput()
   inputIndex = 0;
 }
 
-void keypadLoop(){
-      myKeypad.getKey();
-} 
- 
-void setupSinricPro() {
-  SinricProGarageDoor& myGarageDoor = SinricPro[sinricDeviceID];
-  myGarageDoor.onDoorState(onDoorStateHandler);
+void keypadLoop()
+{
+  myKeypad.getKey();
+}
 
-  // setup SinricPro
-  SinricPro.onConnected([](){ Serial.printf("Connected to SinricPro\r\n"); }); 
-  SinricPro.onDisconnected([](){ Serial.printf("Disconnected from SinricPro\r\n"); });
+void setupSinricPro()
+{
+
+  SinricPro.onConnected([]()
+                        {
+                          Serial.printf("Connected to SinricPro\r\n");
+                          syslog.log(LOG_INFO, "Connected to SinricPro.");
+                        });
+  SinricPro.onDisconnected([]()
+                           { 
+    Serial.printf("Disconnected from SinricPro\r\n"); 
+    syslog.log(LOG_INFO, "Disconnected from SinricPro."); });
+
+  SinricProGarageDoor &myGarageDoor = SinricPro[sinricDeviceID];
+  myGarageDoor.onDoorState(onDoorStateHandler);
 
   SinricPro.begin(sinricAppKey, sinricAppSecret);
 }
 
-bool onDoorStateHandler(const String& deviceId, bool &doorState) {
-  Serial.printf("Garagedoor is %s now.\r\n", doorState?"closed":"open");
+bool onDoorStateHandler(const String &deviceId, bool &doorState)
+{
+  syslog.log(LOG_INFO, "Received Sinric message to toggle door.");
+  openDoor();
+
   return true;
 }
-void sinricLoop() {
-    SinricPro.handle();
+
+void sinricLoop()
+{
+  SinricPro.handle();
 }
 
-void setupWiFi() {
+void setupWiFi()
+{
   WiFi.begin(ssid, wifiPassword); // Connect to the network
+
   Serial.printf("Connecting to %s ...", ssid);
 
   int i = 0;
@@ -170,5 +235,35 @@ void setupWiFi() {
   Serial.println("Connection established!");
   Serial.print("IP address:\t");
   Serial.println(WiFi.localIP()); // Send the IP address of the ESP8266 to the computer
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+  syslog.logf(LOG_INFO, "Connected to wifi. IP: %s", WiFi.localIP());
+}
 
+void loopWebserver()
+{
+  server.handleClient(); // Handle incoming client requests
+}
+
+void setupWebserver()
+{
+  server.on("/", handleRoot);           // Handle root endpoint
+  server.on("/open", handleApiRequest); // Handle API request
+
+  server.begin();
+}
+
+void handleRoot()
+{
+  syslog.logf(LOG_INFO, "Received API request to get health");
+
+  server.send(200, "text/plain", "ESP8266 is running!"); // Default response
+}
+
+void handleApiRequest()
+{
+  syslog.logf(LOG_INFO, "Received API request to open door");
+
+  openDoor(); // Call the function to open the door
+  server.send(200, "text/plain", "Door opened!");
 }
