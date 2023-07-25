@@ -88,6 +88,21 @@ void openDoor()
 void setup()
 {
 
+  pinMode(D0, INPUT_PULLUP);
+  pinMode(D1, INPUT_PULLUP);
+  pinMode(D2, INPUT_PULLUP);
+  pinMode(D3, INPUT_PULLUP);
+  pinMode(D4, INPUT_PULLUP);
+  pinMode(D5, INPUT_PULLUP);
+  pinMode(D6, INPUT_PULLUP);
+  digitalWrite(D0, HIGH);
+  digitalWrite(D1, HIGH);
+  digitalWrite(D2, HIGH);
+  digitalWrite(D3, HIGH);
+  digitalWrite(D4, HIGH);
+  digitalWrite(D5, HIGH);
+  digitalWrite(D6, HIGH);
+
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, HIGH);
 
@@ -116,7 +131,7 @@ void loop()
   keypadLoop();
   sinricLoop();
   server.handleClient(); // Handle incoming client requests
-  delay(5);
+  delay(10);
 }
 
 void setupKeypad()
@@ -145,9 +160,7 @@ void keypadEventHandler(KeypadEvent ekey)
     case '9':
       input[inputIndex] = ekey;
       inputIndex++;
-      Serial.print(ekey);
       syslog.logf(LOG_DEBUG, "Keypad button pushed: %c", ekey);
-
       break;
     // Clear input
     case '*':
@@ -158,6 +171,8 @@ void keypadEventHandler(KeypadEvent ekey)
       Serial.print("\nCLEARED!\n");
       break;
     default:
+      Serial.print(".");
+
       break;
     }
   }
@@ -182,7 +197,14 @@ void resetInput()
 
 void keypadLoop()
 {
-  myKeypad.getKey();
+  char key = myKeypad.getKey();
+  if (key)
+  {
+    Serial.print("\nKeyPress:");
+    Serial.print(key);
+    Serial.print("\n");
+    syslog.logf(LOG_DEBUG, "\nKeyPress: %c\n", key);
+  }
 }
 
 void setupSinricPro()
@@ -191,8 +213,7 @@ void setupSinricPro()
   SinricPro.onConnected([]()
                         {
                           Serial.printf("Connected to SinricPro\r\n");
-                          syslog.log(LOG_INFO, "Connected to SinricPro.");
-                        });
+                          syslog.log(LOG_INFO, "Connected to SinricPro."); });
   SinricPro.onDisconnected([]()
                            { 
     Serial.printf("Disconnected from SinricPro\r\n"); 
@@ -237,7 +258,7 @@ void setupWiFi()
   Serial.println(WiFi.localIP()); // Send the IP address of the ESP8266 to the computer
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
-  syslog.logf(LOG_INFO, "Connected to wifi. IP: %s", WiFi.localIP());
+  syslog.logf(LOG_INFO, "Connected to wifi. IP: %s", WiFi.localIP().toString().c_str());
 }
 
 void loopWebserver()
